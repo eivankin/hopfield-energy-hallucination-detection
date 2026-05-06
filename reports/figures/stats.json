@@ -1,0 +1,17 @@
+{
+  "features_file": "outputs/001_qwen05b_squad_hopfield/features.npz",
+  "n": 689,
+  "truthful": 206,
+  "hallucinated": 483,
+  "energy_min": -61.54817199707031,
+  "energy_max": -39.84324264526367,
+  "energy_mean_truthful": -49.373531341552734,
+  "energy_mean_hallucinated": -47.77605438232422,
+  "nll_min": 3.98961674363818e-05,
+  "nll_max": 7.283625602722168,
+  "nll_mean_truthful": 0.8697119951248169,
+  "nll_mean_hallucinated": 1.4762412309646606,
+  "energy_auc": 0.6193742587790709,
+  "nll_auc": 0.6635108243381775,
+  "length_auc": 0.5594735572574324
+}
