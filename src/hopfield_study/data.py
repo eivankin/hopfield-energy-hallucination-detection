@@ -14,6 +14,11 @@ CONTEXT_RE = re.compile(
     r"(.*?)\n\nNote that your answer",
     re.DOTALL,
 )
+GENERIC_CONTEXT_RE = re.compile(
+    r"Given the context, answer the question in a single brief but complete sentence\.\n\n"
+    r"(.*?)\n\nHere is the question:",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,10 @@ def _extract(pattern: re.Pattern[str], text: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _extract_context(prompt: str) -> str:
+    return _extract(CONTEXT_RE, prompt) or _extract(GENERIC_CONTEXT_RE, prompt)
+
+
 def load_examples(path: str | Path, max_samples: int = 0) -> list[Example]:
     df = pd.read_csv(path)
     if max_samples and max_samples > 0:
@@ -53,7 +62,7 @@ def load_examples(path: str | Path, max_samples: int = 0) -> list[Example]:
                 prompt=prompt,
                 response=response,
                 label=int(float(label_value)),
-                context=_extract(CONTEXT_RE, prompt),
+                context=_extract_context(prompt),
                 question=_extract(QUESTION_RE, prompt),
             )
         )

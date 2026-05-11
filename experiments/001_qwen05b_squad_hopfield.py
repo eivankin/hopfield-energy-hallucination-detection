@@ -7,8 +7,18 @@ from pathlib import Path
 import numpy as np
 
 from hopfield_study.data import labels_array, load_examples
-from hopfield_study.evaluate import cv_logreg_metrics, majority_metrics, scalar_score_metrics
-from hopfield_study.extract import DEFAULT_LAYERS, DEFAULT_MODEL, extract_features, load_model_and_tokenizer
+from hopfield_study.evaluate import (
+    cv_logreg_grid_metrics,
+    cv_logreg_metrics,
+    majority_metrics,
+    scalar_score_metrics,
+)
+from hopfield_study.extract import (
+    DEFAULT_LAYERS,
+    DEFAULT_MODEL,
+    extract_features,
+    load_model_and_tokenizer,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,29 +65,95 @@ def main() -> None:
         max_response_tokens=args.max_response_tokens,
     )
 
-    hopfield_names = [
+    layer_feature_names = [
         "energy_mean_layermean",
         "energy_std_layermean",
         "energy_max_layermean",
         "energy_final_layermean",
+        "prompt_attention_mass_mean_layermean",
+        "prompt_attention_mass_final_layermean",
+        "prompt_attention_max_mean_layermean",
+        "prompt_attention_entropy_mean_layermean",
         "energy_mean_layerstd",
         "energy_std_layerstd",
         "energy_max_layerstd",
         "energy_final_layerstd",
+        "prompt_attention_mass_mean_layerstd",
+        "prompt_attention_mass_final_layerstd",
+        "prompt_attention_max_mean_layerstd",
+        "prompt_attention_entropy_mean_layerstd",
     ]
+    per_layer_names = []
+    base_layer_names = [
+        "energy_mean",
+        "energy_std",
+        "energy_max",
+        "energy_final",
+        "prompt_attention_mass_mean",
+        "prompt_attention_mass_final",
+        "prompt_attention_max_mean",
+        "prompt_attention_entropy_mean",
+    ]
+    for layer in args.layers:
+        per_layer_names.extend([f"layer{layer}_{name}" for name in base_layer_names])
+
     X_nll = features.nll.reshape(-1, 1)
-    X_hopfield = features.hopfield
-    X_combined = np.column_stack([features.nll, features.response_length, X_hopfield])
+    X_nll_length = np.column_stack([features.nll, features.response_length])
+    X_summary = features.hopfield
+    X_per_layer = features.layer_features
+    energy_cols = [0, 1, 2, 3, 8, 9, 10, 11]
+    attention_cols = [4, 5, 6, 7, 12, 13, 14, 15]
+    per_layer_energy_cols = [
+        idx
+        for idx, name in enumerate(per_layer_names)
+        if name.endswith(("energy_mean", "energy_std", "energy_max", "energy_final"))
+    ]
+    per_layer_attention_cols = [
+        idx for idx, name in enumerate(per_layer_names) if "prompt_attention" in name
+    ]
+    X_energy = X_summary[:, energy_cols]
+    X_attention = X_summary[:, attention_cols]
+    X_combined_summary = np.column_stack([features.nll, features.response_length, X_summary])
+    X_combined_per_layer = np.column_stack([features.nll, features.response_length, X_per_layer])
+    groups = np.asarray([ex.context for ex in examples])
 
     metrics = [
         majority_metrics(y),
         scalar_score_metrics("response_length_scalar", features.response_length, y),
         scalar_score_metrics("response_nll_scalar", features.nll, y),
-        scalar_score_metrics("hopfield_energy_mean_scalar", X_hopfield[:, 0], y),
-        scalar_score_metrics("hopfield_energy_mean_neg_scalar", -X_hopfield[:, 0], y),
+        scalar_score_metrics("hopfield_energy_mean_scalar", X_summary[:, 0], y),
+        scalar_score_metrics("hopfield_energy_mean_neg_scalar", -X_summary[:, 0], y),
+        scalar_score_metrics("prompt_attention_mass_scalar", X_summary[:, 4], y),
+        scalar_score_metrics("prompt_attention_entropy_scalar", X_summary[:, 7], y),
         cv_logreg_metrics("response_nll_logreg", X_nll, y),
-        cv_logreg_metrics("hopfield_logreg", X_hopfield, y),
-        cv_logreg_metrics("nll_length_hopfield_logreg", X_combined, y),
+        cv_logreg_metrics("nll_length_logreg", X_nll_length, y),
+        cv_logreg_metrics("hopfield_energy_summary_logreg", X_energy, y),
+        cv_logreg_metrics("attention_summary_logreg", X_attention, y),
+        cv_logreg_metrics(
+            "hopfield_energy_per_layer_logreg",
+            X_per_layer[:, per_layer_energy_cols],
+            y,
+        ),
+        cv_logreg_metrics(
+            "attention_per_layer_logreg",
+            X_per_layer[:, per_layer_attention_cols],
+            y,
+        ),
+        cv_logreg_metrics("hopfield_all_summary_logreg", X_summary, y),
+        cv_logreg_metrics("hopfield_all_per_layer_logreg", X_per_layer, y),
+        cv_logreg_metrics("nll_length_hopfield_summary_logreg", X_combined_summary, y),
+        cv_logreg_metrics("nll_length_hopfield_per_layer_logreg", X_combined_per_layer, y),
+        cv_logreg_grid_metrics(
+            "nll_length_hopfield_per_layer_logreg_grid",
+            X_combined_per_layer,
+            y,
+        ),
+        cv_logreg_metrics(
+            "context_group_nll_length_hopfield_summary_logreg",
+            X_combined_summary,
+            y,
+            groups=groups,
+        ),
     ]
 
     metrics_payload = {
@@ -91,8 +167,10 @@ def main() -> None:
         "layers": list(args.layers),
         "max_response_tokens": args.max_response_tokens,
         "feature_names": {
-            "hopfield": hopfield_names,
-            "combined": ["response_nll", "response_length", *hopfield_names],
+            "hopfield_summary": layer_feature_names,
+            "per_layer": per_layer_names,
+            "combined_summary": ["response_nll", "response_length", *layer_feature_names],
+            "combined_per_layer": ["response_nll", "response_length", *per_layer_names],
         },
         "metrics": [row.__dict__ for row in metrics],
     }
@@ -103,6 +181,7 @@ def main() -> None:
         nll=features.nll,
         response_length=features.response_length,
         hopfield=features.hopfield,
+        layer_features=features.layer_features,
     )
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics_payload, indent=2),

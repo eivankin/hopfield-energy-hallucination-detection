@@ -21,6 +21,7 @@ class FeatureBatch:
     nll: np.ndarray
     response_length: np.ndarray
     hopfield: np.ndarray
+    layer_features: np.ndarray
 
 
 def load_model_and_tokenizer(model_name: str = DEFAULT_MODEL, device: str | None = None):
@@ -56,6 +57,7 @@ def extract_features(
     all_nll: list[float] = []
     all_lengths: list[float] = []
     all_hopfield: list[np.ndarray] = []
+    all_layer_features: list[np.ndarray] = []
     selected_layers = tuple(layers)
 
     for start in tqdm(range(0, len(examples), batch_size), desc="extract"):
@@ -95,19 +97,27 @@ def extract_features(
         )
         all_nll.extend(losses.tolist())
         all_lengths.extend([float(len(pos)) for pos in response_positions])
-        all_hopfield.extend(collector.features())
+        summary_features, layer_features = collector.features()
+        all_hopfield.extend(summary_features)
+        all_layer_features.extend(layer_features)
 
     return FeatureBatch(
         nll=np.asarray(all_nll, dtype=np.float32),
         response_length=np.asarray(all_lengths, dtype=np.float32),
         hopfield=np.vstack(all_hopfield).astype(np.float32),
+        layer_features=np.vstack(all_layer_features).astype(np.float32),
     )
 
 
 class HopfieldEnergyCollector:
     """Collect compact Q/K Hopfield energy summaries from selected Qwen2 layers."""
 
-    def __init__(self, model, layers: tuple[int, ...], response_positions: list[torch.Tensor]) -> None:
+    def __init__(
+        self,
+        model,
+        layers: tuple[int, ...],
+        response_positions: list[torch.Tensor],
+    ) -> None:
         self.model = model
         self.layers = layers
         self.response_positions = response_positions
@@ -128,13 +138,13 @@ class HopfieldEnergyCollector:
             handle.remove()
         self.handles.clear()
 
-    def features(self) -> list[np.ndarray]:
+    def features(self) -> tuple[list[np.ndarray], list[np.ndarray]]:
         pieces = []
         for layer_idx in self.layers:
             if layer_idx not in self.by_layer:
                 raise RuntimeError(f"Missing Hopfield features for layer {layer_idx}")
             pieces.append(self.by_layer[layer_idx])
-        stacked = np.stack(pieces, axis=1)  # (batch, layers, 4)
+        stacked = np.stack(pieces, axis=1)  # (batch, layers, features)
         combined = np.concatenate(
             [
                 stacked.mean(axis=1),
@@ -142,7 +152,11 @@ class HopfieldEnergyCollector:
             ],
             axis=1,
         )
-        return [combined[i] for i in range(combined.shape[0])]
+        flattened = stacked.reshape(stacked.shape[0], -1)
+        return (
+            [combined[i] for i in range(combined.shape[0])],
+            [flattened[i] for i in range(flattened.shape[0])],
+        )
 
     def _make_hook(self, layer_idx: int):
         def hook(module, args, kwargs):
@@ -254,7 +268,11 @@ def _layer_energy_features(
     rows: list[np.ndarray] = []
     for batch_idx in range(batch_size):
         resp_pos = response_positions[batch_idx].to(hidden_states.device)
+        prompt_pos = seq_positions[seq_positions < int(resp_pos[0].item())]
         energies_per_head: list[torch.Tensor] = []
+        prompt_mass_per_head: list[torch.Tensor] = []
+        prompt_max_per_head: list[torch.Tensor] = []
+        prompt_entropy_per_head: list[torch.Tensor] = []
         for head_idx in range(num_heads):
             kv_head_idx = min(head_idx // group_size, num_kv_heads - 1)
             q = query_states[batch_idx, head_idx, resp_pos, :]  # (response, dim)
@@ -264,7 +282,26 @@ def _layer_energy_features(
             scores = scores.masked_fill(~causal, float("-inf"))
             energy = -inv_scaling * torch.logsumexp(scores, dim=-1)
             energies_per_head.append(energy)
+            probs = torch.softmax(scores, dim=-1)
+            if prompt_pos.numel() == 0:
+                prompt_mass = torch.zeros_like(energy)
+                prompt_max = torch.zeros_like(energy)
+                prompt_entropy = torch.zeros_like(energy)
+            else:
+                prompt_probs = probs.index_select(1, prompt_pos)
+                prompt_mass = prompt_probs.sum(dim=-1)
+                prompt_max = prompt_probs.max(dim=-1).values
+                normalized_prompt = prompt_probs / prompt_mass.clamp(min=1e-10).unsqueeze(-1)
+                prompt_entropy = -(
+                    normalized_prompt * (normalized_prompt + 1e-10).log()
+                ).sum(dim=-1)
+            prompt_mass_per_head.append(prompt_mass)
+            prompt_max_per_head.append(prompt_max)
+            prompt_entropy_per_head.append(prompt_entropy)
         values = torch.stack(energies_per_head, dim=0).flatten()
+        prompt_mass_values = torch.stack(prompt_mass_per_head, dim=0)
+        prompt_max_values = torch.stack(prompt_max_per_head, dim=0)
+        prompt_entropy_values = torch.stack(prompt_entropy_per_head, dim=0)
         rows.append(
             np.asarray(
                 [
@@ -272,6 +309,10 @@ def _layer_energy_features(
                     float(values.std(unbiased=False).item()),
                     float(values.max().item()),
                     float(torch.stack(energies_per_head, dim=0)[:, -1].mean().item()),
+                    float(prompt_mass_values.mean().item()),
+                    float(prompt_mass_values[:, -1].mean().item()),
+                    float(prompt_max_values.mean().item()),
+                    float(prompt_entropy_values.mean().item()),
                 ],
                 dtype=np.float32,
             )
